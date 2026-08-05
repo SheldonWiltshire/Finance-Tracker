@@ -1,4 +1,3 @@
-import { storage } from "./storage.js";
 import React, { useState, useEffect, useMemo, useRef } from "react";
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip,
@@ -69,9 +68,48 @@ function defaultData() {
     ],
     expenses: [],
     targets: { netWorthTargets: [], manualMonthlySavings: 0 },
+    accounts: defaultAccounts(),
     netWorthHistory: [],
     bonusResults: [],
   };
+}
+
+function defaultAccounts() {
+  return [
+    { id: uid(), name: "Savings account 1", type: "asset" },
+    { id: uid(), name: "Current account", type: "asset" },
+    { id: uid(), name: "Owed to me", type: "asset" },
+    { id: uid(), name: "Owed by me", type: "liability" },
+  ];
+}
+
+function migrateSnapshot(entry) {
+  if (Array.isArray(entry.balances)) return entry;
+  // Migrate from the old {assets, liabilities} aggregate shape.
+  const balances = [];
+  if (entry.assets !== undefined) {
+    balances.push({ accountId: "legacy-assets", name: "Assets (legacy)", type: "asset", amount: Number(entry.assets || 0) });
+  }
+  if (entry.liabilities !== undefined) {
+    balances.push({ accountId: "legacy-liabilities", name: "Liabilities (legacy)", type: "liability", amount: Number(entry.liabilities || 0) });
+  }
+  return { id: entry.id, date: entry.date, balances };
+}
+
+function netWorthOfSnapshot(snapshot) {
+  return (snapshot.balances || []).reduce(
+    (s, b) => s + (b.type === "liability" ? -Number(b.amount || 0) : Number(b.amount || 0)),
+    0
+  );
+}
+
+function migrateData(parsed) {
+  parsed.targets = migrateTargets(parsed.targets);
+  if (!Array.isArray(parsed.accounts) || parsed.accounts.length === 0) {
+    parsed.accounts = defaultAccounts();
+  }
+  parsed.netWorthHistory = (parsed.netWorthHistory || []).map(migrateSnapshot);
+  return parsed;
 }
 
 function migrateTargets(targets) {
@@ -266,11 +304,10 @@ export default function FinanceTracker() {
   useEffect(() => {
     (async () => {
       try {
-        const res = await storage.get(STORAGE_KEY);
+        const res = await window.storage.get(STORAGE_KEY, false);
         if (res && res.value) {
           const parsed = JSON.parse(res.value);
-          parsed.targets = migrateTargets(parsed.targets);
-          setData(parsed);
+          setData(migrateData(parsed));
         } else {
           setData(defaultData());
         }
@@ -286,7 +323,7 @@ export default function FinanceTracker() {
     if (!loaded || !data) return;
     if (saveTimer.current) clearTimeout(saveTimer.current);
     saveTimer.current = setTimeout(() => {
-      storage.set(STORAGE_KEY, JSON.stringify(data)).catch(() => {});
+      window.storage.set(STORAGE_KEY, JSON.stringify(data), false).catch(() => {});
     }, 400);
     return () => clearTimeout(saveTimer.current);
   }, [data, loaded]);
@@ -321,10 +358,11 @@ export default function FinanceTracker() {
     const sortedHistory = [...data.netWorthHistory].sort((a, b) => a.date.localeCompare(b.date));
     const netWorthPoints = sortedHistory.map((h) => ({
       date: h.date,
-      actual: Number(h.assets || 0) - Number(h.liabilities || 0),
+      actual: netWorthOfSnapshot(h),
     }));
     const rawNetWorth = netWorthPoints.length ? netWorthPoints[netWorthPoints.length - 1].actual : 0;
-    const latestSnapshotMonth = sortedHistory.length ? monthKeyOf(sortedHistory[sortedHistory.length - 1].date) : null;
+    const latestSnapshot = sortedHistory.length ? sortedHistory[sortedHistory.length - 1] : null;
+    const latestSnapshotMonth = latestSnapshot ? monthKeyOf(latestSnapshot.date) : null;
 
     const quartersSeen = Array.from(new Set(data.bonusResults.map((r) => quarterOfMonth(r.month))));
     let unclaimedBonus = 0;
@@ -359,7 +397,7 @@ export default function FinanceTracker() {
     if (netWorthPoints.length >= 2) {
       const first = sortedHistory[0];
       const months = Math.max(1, monthsBetween(monthKeyOf(first.date), monthKeyOf(sortedHistory[sortedHistory.length - 1].date)));
-      avgMonthlyGrowth = (rawNetWorth - (Number(first.assets) - Number(first.liabilities))) / months;
+      avgMonthlyGrowth = (rawNetWorth - netWorthOfSnapshot(first)) / months;
     } else {
       avgMonthlyGrowth = savingsGoal;
     }
@@ -377,7 +415,7 @@ export default function FinanceTracker() {
       fixedTotal, budgetTotal, income, savingsGoal, available, spent, remaining,
       categoryRows, netWorthPoints, latestNetWorth, rawNetWorth, unclaimedBonus, avgMonthlyGrowth,
       currentQuarter, accruedThisQuarter, monthsEnteredThisQuarter,
-      targetsComputed, primaryTarget,
+      targetsComputed, primaryTarget, latestSnapshot,
     };
   }, [data, viewMonth]);
 
@@ -702,18 +740,61 @@ function BonusTab({ data, update, derived }) {
   );
 }
 
-function NetWorthTab({ data, update, derived }) {
-  const [form, setForm] = useState({ date: todayISO(), assets: "", liabilities: "" });
-  const [targetForm, setTargetForm] = useState({ name: "", amount: "", date: "" });
+function ProgressBar({ pct, color }) {
+  const clamped = Math.max(0, Math.min(100, pct));
+  return (
+    <div style={{ height: 8, background: SURFACE_2, borderRadius: 4, overflow: "hidden", border: `1px solid ${BORDER}`, marginTop: 6 }}>
+      <div style={{ height: "100%", width: `${clamped}%`, background: color, transition: "width 0.3s" }} />
+    </div>
+  );
+}
 
-  const addSnapshot = () => {
-    if (form.assets === "" && form.liabilities === "") return;
-    update((d) => {
-      d.netWorthHistory.push({ id: uid(), date: form.date, assets: Number(form.assets || 0), liabilities: Number(form.liabilities || 0) });
+function NetWorthTab({ data, update, derived }) {
+  const [targetForm, setTargetForm] = useState({ name: "", amount: "", date: "" });
+  const [snapshotDate, setSnapshotDate] = useState(todayISO());
+  const [values, setValues] = useState({});
+  const [accountForm, setAccountForm] = useState({ name: "", type: "asset" });
+
+  const sortedHistory = [...data.netWorthHistory].sort((a, b) => a.date.localeCompare(b.date));
+  const targetColors = [RUST, TEAL, GOLD, "#7A6BB0", "#4C86C0"];
+
+  useEffect(() => {
+    const existing = data.netWorthHistory.find((h) => h.date === snapshotDate);
+    const next = {};
+    data.accounts.forEach((acc) => {
+      const found = existing?.balances.find((b) => b.accountId === acc.id);
+      next[acc.id] = found ? String(found.amount) : "";
     });
-    setForm({ date: todayISO(), assets: "", liabilities: "" });
+    setValues(next);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [snapshotDate, data.accounts.length]);
+
+  const saveSnapshot = () => {
+    update((d) => {
+      const balances = d.accounts.map((acc) => ({
+        accountId: acc.id,
+        name: acc.name,
+        type: acc.type,
+        amount: Number(values[acc.id] || 0),
+      }));
+      const idx = d.netWorthHistory.findIndex((h) => h.date === snapshotDate);
+      if (idx >= 0) d.netWorthHistory[idx].balances = balances;
+      else d.netWorthHistory.push({ id: uid(), date: snapshotDate, balances });
+    });
   };
   const removeSnapshot = (id) => update((d) => { d.netWorthHistory = d.netWorthHistory.filter((h) => h.id !== id); });
+  const loadSnapshot = (date) => setSnapshotDate(date);
+
+  const addAccount = () => {
+    if (!accountForm.name) return;
+    update((d) => { d.accounts.push({ id: uid(), name: accountForm.name, type: accountForm.type }); });
+    setAccountForm({ name: "", type: "asset" });
+  };
+  const removeAccount = (id) => update((d) => { d.accounts = d.accounts.filter((a) => a.id !== id); });
+  const editAccount = (id, field, val) => update((d) => {
+    const a = d.accounts.find((x) => x.id === id);
+    if (a) a[field] = val;
+  });
 
   const addTarget = () => {
     if (!targetForm.amount || !targetForm.date) return;
@@ -743,8 +824,10 @@ function NetWorthTab({ data, update, derived }) {
     t[field] = field === "amount" ? Number(val) : val;
   });
 
-  const sortedHistory = [...data.netWorthHistory].sort((a, b) => a.date.localeCompare(b.date));
-  const targetColors = [RUST, TEAL, GOLD, "#7A6BB0", "#4C86C0"];
+  const previewNetWorth = data.accounts.reduce((s, acc) => {
+    const v = Number(values[acc.id] || 0);
+    return s + (acc.type === "liability" ? -v : v);
+  }, 0);
 
   return (
     <div>
@@ -787,6 +870,31 @@ function NetWorthTab({ data, update, derived }) {
         )}
       </Card>
 
+      {derived.latestSnapshot && (
+        <Card style={{ marginBottom: 16 }}>
+          <div style={{ fontSize: 13, color: TEXT_DIM, marginBottom: 10 }}>Current balance by account (as of {derived.latestSnapshot.date})</div>
+          <div style={{ height: Math.max(120, (derived.latestSnapshot.balances || []).length * 36) }}>
+            <ResponsiveContainer width="100%" height="100%">
+              <BarChart data={derived.latestSnapshot.balances || []} layout="vertical" margin={{ left: 10, right: 20 }}>
+                <CartesianGrid horizontal={false} stroke={BORDER} />
+                <XAxis type="number" tick={{ fill: TEXT_FAINT, fontSize: 11 }} axisLine={{ stroke: BORDER }} tickLine={false} tickFormatter={(v) => fmt(v)} />
+                <YAxis type="category" dataKey="name" tick={{ fill: TEXT_DIM, fontSize: 12 }} axisLine={{ stroke: BORDER }} tickLine={false} width={110} />
+                <Tooltip contentStyle={{ background: SURFACE_2, border: `1px solid ${BORDER}`, borderRadius: 6, fontSize: 12 }} formatter={(v) => fmt(v)} />
+                <Bar dataKey="amount" radius={[0, 4, 4, 0]} barSize={14}>
+                  {(derived.latestSnapshot.balances || []).map((b, i) => (
+                    <Cell key={i} fill={b.type === "liability" ? RUST : TEAL} />
+                  ))}
+                </Bar>
+              </BarChart>
+            </ResponsiveContainer>
+          </div>
+          <div style={{ display: "flex", gap: 16, fontSize: 11, color: TEXT_DIM, marginTop: 6 }}>
+            <span style={{ display: "flex", alignItems: "center", gap: 4 }}><span style={{ width: 9, height: 9, background: TEAL, borderRadius: 2 }} />You own (assets)</span>
+            <span style={{ display: "flex", alignItems: "center", gap: 4 }}><span style={{ width: 9, height: 9, background: RUST, borderRadius: 2 }} />You owe (liabilities)</span>
+          </div>
+        </Card>
+      )}
+
       <Card style={{ marginBottom: 16 }}>
         <div style={{ fontSize: 13, color: TEXT_DIM, marginBottom: 10 }}>Targets</div>
         {derived.targetsComputed.length === 0 && <div style={{ fontSize: 13, color: TEXT_FAINT, marginBottom: 10 }}>No targets yet — add one below.</div>}
@@ -809,20 +917,23 @@ function NetWorthTab({ data, update, derived }) {
               </label>
               <button style={iconBtnStyle} onClick={() => removeTarget(t.id)} aria-label="Remove target"><Trash2 size={15} /></button>
             </div>
-            <div style={{ fontSize: 13, color: TEXT_DIM, marginTop: 6, marginLeft: 22 }}>
-              {!t.date
-                ? <span style={{ color: TEXT_FAINT }}>Add a target date to see the monthly requirement</span>
-                : t.overdue
-                ? <span style={{ color: RUST }}>Target date has passed</span>
-                : (
-                  <>
-                    <span style={{ color: t.progressPct >= 100 ? TEAL : TEXT_DIM }}>{Math.round(t.progressPct)}% there</span>
-                    {" · "}
-                    {t.requiredMonthly <= 0
-                      ? <span style={{ color: TEAL }}>already on track, no monthly amount needed</span>
-                      : <span>needs {fmt(t.requiredMonthly)}/month ({t.monthsLeft} month{t.monthsLeft === 1 ? "" : "s"} left)</span>}
-                  </>
-                )}
+            <div style={{ marginLeft: 22 }}>
+              <div style={{ fontSize: 13, color: TEXT_DIM, marginTop: 6 }}>
+                {!t.date
+                  ? <span style={{ color: TEXT_FAINT }}>Add a target date to see the monthly requirement</span>
+                  : t.overdue
+                  ? <span style={{ color: RUST }}>Target date has passed</span>
+                  : (
+                    <>
+                      <span style={{ color: t.progressPct >= 100 ? TEAL : TEXT_DIM }}>{Math.round(t.progressPct)}% there</span>
+                      {" · "}
+                      {t.requiredMonthly <= 0
+                        ? <span style={{ color: TEAL }}>already on track, no monthly amount needed</span>
+                        : <span>needs {fmt(t.requiredMonthly)}/month ({t.monthsLeft} month{t.monthsLeft === 1 ? "" : "s"} left)</span>}
+                    </>
+                  )}
+              </div>
+              <ProgressBar pct={t.progressPct} color={targetColors[i % targetColors.length]} />
             </div>
           </div>
         ))}
@@ -842,30 +953,75 @@ function NetWorthTab({ data, update, derived }) {
       </Card>
 
       <Card style={{ marginBottom: 16 }}>
-        <div style={{ fontSize: 13, color: TEXT_DIM, marginBottom: 10 }}>Add a net worth snapshot</div>
-        <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "flex-end" }}>
-          <Field label="Date">
-            <input style={inputStyle} type="date" value={form.date} onChange={(e) => setForm({ ...form, date: e.target.value })} />
-          </Field>
-          <Field label="Total assets">
-            <input style={inputStyle} type="number" placeholder="0" value={form.assets} onChange={(e) => setForm({ ...form, assets: e.target.value })} />
-          </Field>
-          <Field label="Total liabilities">
-            <input style={inputStyle} type="number" placeholder="0" value={form.liabilities} onChange={(e) => setForm({ ...form, liabilities: e.target.value })} />
-          </Field>
-          <button style={{ ...buttonStyle, color: GOLD, borderColor: GOLD }} onClick={addSnapshot}><Plus size={14} />Add snapshot</button>
+        <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 10 }}>
+          <div style={{ fontSize: 13, color: TEXT_DIM }}>Accounts you track</div>
         </div>
+        {data.accounts.map((acc) => (
+          <div key={acc.id} style={{ display: "flex", gap: 10, alignItems: "center", padding: "8px 0", borderTop: `1px solid ${BORDER}` }}>
+            <input style={{ ...inputStyle, fontFamily: "inherit", flex: "1 1 160px" }} value={acc.name} onChange={(e) => editAccount(acc.id, "name", e.target.value)} />
+            <select style={inputStyle} value={acc.type} onChange={(e) => editAccount(acc.id, "type", e.target.value)}>
+              <option value="asset">Asset (you own it)</option>
+              <option value="liability">Liability (you owe it)</option>
+            </select>
+            <button style={iconBtnStyle} onClick={() => removeAccount(acc.id)} aria-label="Remove account"><Trash2 size={15} /></button>
+          </div>
+        ))}
+        <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "flex-end", marginTop: 14, paddingTop: 14, borderTop: `1px solid ${BORDER}` }}>
+          <Field label="Account name">
+            <input style={inputStyle} type="text" placeholder="e.g. ISA" value={accountForm.name} onChange={(e) => setAccountForm({ ...accountForm, name: e.target.value })} />
+          </Field>
+          <Field label="Type">
+            <select style={inputStyle} value={accountForm.type} onChange={(e) => setAccountForm({ ...accountForm, type: e.target.value })}>
+              <option value="asset">Asset (you own it)</option>
+              <option value="liability">Liability (you owe it)</option>
+            </select>
+          </Field>
+          <button style={{ ...buttonStyle, color: GOLD, borderColor: GOLD }} onClick={addAccount}><Plus size={14} />Add account</button>
+        </div>
+      </Card>
+
+      <Card style={{ marginBottom: 16 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 10 }}>
+          <div style={{ fontSize: 13, color: TEXT_DIM }}>Update balances</div>
+          <Field label="Date">
+            <input style={inputStyle} type="date" value={snapshotDate} onChange={(e) => setSnapshotDate(e.target.value)} />
+          </Field>
+        </div>
+        {data.accounts.length === 0 && <div style={{ fontSize: 13, color: TEXT_FAINT }}>Add an account above first.</div>}
+        <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+          {data.accounts.map((acc) => (
+            <Field key={acc.id} label={acc.name}>
+              <input
+                style={{ ...inputStyle, width: 130 }}
+                type="number"
+                placeholder="0"
+                value={values[acc.id] ?? ""}
+                onChange={(e) => setValues({ ...values, [acc.id]: e.target.value })}
+              />
+            </Field>
+          ))}
+        </div>
+        {data.accounts.length > 0 && (
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 14 }}>
+            <div style={{ fontSize: 13, color: TEXT_DIM }}>Net worth for this date: <span style={{ color: TEXT, fontFamily: "ui-monospace, monospace" }}>{fmt(previewNetWorth)}</span></div>
+            <button style={{ ...buttonStyle, color: GOLD, borderColor: GOLD }} onClick={saveSnapshot}><Plus size={14} />Save snapshot</button>
+          </div>
+        )}
       </Card>
 
       <Card>
         <div style={{ fontSize: 13, color: TEXT_DIM, marginBottom: 10 }}>Snapshot history</div>
         {sortedHistory.length === 0 && <div style={{ fontSize: 13, color: TEXT_FAINT }}>No snapshots yet.</div>}
         {[...sortedHistory].reverse().map((h) => (
-          <div key={h.id} style={{ display: "flex", gap: 10, alignItems: "center", padding: "6px 0", borderTop: `1px solid ${BORDER}`, fontSize: 13 }}>
-            <div style={{ width: 100, color: TEXT_FAINT }}>{h.date}</div>
-            <div style={{ flex: 1 }}>Assets {fmt(h.assets)} · Liabilities {fmt(h.liabilities)}</div>
-            <div style={{ width: 90, textAlign: "right", fontFamily: "ui-monospace, monospace" }}>{fmt(h.assets - h.liabilities)}</div>
-            <button style={iconBtnStyle} onClick={() => removeSnapshot(h.id)} aria-label="Remove snapshot"><Trash2 size={14} /></button>
+          <div key={h.id} style={{ padding: "8px 0", borderTop: `1px solid ${BORDER}`, fontSize: 13 }}>
+            <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+              <button style={{ ...iconBtnStyle, color: TEXT_DIM, fontSize: 13 }} onClick={() => loadSnapshot(h.date)}>{h.date}</button>
+              <div style={{ flex: 1, color: TEXT_DIM, fontSize: 12 }}>
+                {(h.balances || []).map((b) => `${b.name}: ${fmt(b.amount)}`).join(" · ")}
+              </div>
+              <div style={{ width: 90, textAlign: "right", fontFamily: "ui-monospace, monospace" }}>{fmt(netWorthOfSnapshot(h))}</div>
+              <button style={iconBtnStyle} onClick={() => removeSnapshot(h.id)} aria-label="Remove snapshot"><Trash2 size={14} /></button>
+            </div>
           </div>
         ))}
       </Card>
