@@ -5,7 +5,7 @@ import react from "@vitejs/plugin-react";
 // If your repo is at github.com/yourname/finance-tracker, this stays as is.
 // If GitHub Pages is served from a custom domain or a user/org root site
 // (yourname.github.io), set this to "/" instead.
-const REPO_NAME = "/finance-tracker/";
+const REPO_NAME = "/Finance-Tracker/";
 
 export default defineConfig({
   plugins: [react()],
